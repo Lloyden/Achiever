@@ -9,6 +9,11 @@ local ACHIEVER_READY = false
 local ACHIEVER_SYNC_COMPLETE = { categories = false, achievements = false, criteria = false }
 local ACHIEVER_PENDING_ACHIEVEMENTS = {}
 local ACHIEVER_PENDING_CRITERIA = {}
+local ACHIEVER_SYNC_ABORTED = false
+local ACHIEVER_SYNC_RETRY_AT = nil
+local ACHIEVER_SYNC_RETRY_COUNT = 0
+local ACHIEVER_MAX_SYNC_RETRIES = 3
+local ACHIEVER_SYNC_RETRY_DELAY = 3
 
 local function debug(msg)
     if achieverDBpc.debug == "enabled" then
@@ -70,6 +75,12 @@ local function joinFields(fields, first, last, separator)
     return result
 end
 
+local function isMetadataMessage(messageType)
+    return messageType == 'AC' or messageType == 'ACV' or
+        messageType == 'CA' or messageType == 'CAV' or
+        messageType == 'CR' or messageType == 'CRV'
+end
+
 Achiever:RegisterEvent("ADDON_LOADED")
 Achiever:RegisterEvent("CHAT_MSG_CHANNEL_NOTICE")
 Achiever:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -111,6 +122,7 @@ Achiever.updateReadyState = function(self)
     end
 
     ACHIEVER_READY = true
+    ACHIEVER_SYNC_RETRY_COUNT = 0
     DEFAULT_CHAT_FRAME:AddMessage('|cff00ff00Achiever: data loaded. You can now open the achievement window.|r')
 
     -- Events can arrive while the definitions are still downloading.  Store
@@ -123,6 +135,68 @@ Achiever.updateReadyState = function(self)
         self:updateCriteriaUI(id, achievementId)
     end
     ACHIEVER_PENDING_CRITERIA = {}
+end
+
+Achiever.abortSync = function(self, dataType)
+    if (ACHIEVER_SYNC_ABORTED) then return end
+
+    ACHIEVER_SYNC_ABORTED = true
+    ACHIEVER_READY = false
+    ACHIEVER_SYNC_COMPLETE = {
+        categories = false,
+        achievements = false,
+        criteria = false
+    }
+
+    if (ACHIEVER_SYNC_RETRY_COUNT >= ACHIEVER_MAX_SYNC_RETRIES) then
+        ACHIEVER_SYNC_RETRY_AT = nil
+        DEFAULT_CHAT_FRAME:AddMessage(
+            '|cffff2020Achiever: malformed ' .. dataType ..
+            ' data. Loading aborted after ' ..
+            ACHIEVER_MAX_SYNC_RETRIES ..
+            ' retries. Use /reload to try again.|r'
+        )
+        return
+    end
+
+    ACHIEVER_SYNC_RETRY_AT = GetTime() + ACHIEVER_SYNC_RETRY_DELAY
+
+    DEFAULT_CHAT_FRAME:AddMessage(
+        '|cffffa500Achiever: malformed ' .. dataType ..
+        ' data. Loading aborted; automatic retry ' ..
+        (ACHIEVER_SYNC_RETRY_COUNT + 1) .. '/' ..
+        ACHIEVER_MAX_SYNC_RETRIES ..
+        ' will start when the current transfer has stopped.|r'
+    )
+end
+
+Achiever.retrySync = function(self)
+    ACHIEVER_SYNC_RETRY_COUNT = ACHIEVER_SYNC_RETRY_COUNT + 1
+    ACHIEVER_SYNC_RETRY_AT = nil
+    ACHIEVER_SYNC_ABORTED = false
+    ACHIEVER_READY = false
+
+    ACHIEVER_SYNC_COMPLETE = {
+        categories = false,
+        achievements = false,
+        criteria = false
+    }
+
+    -- Delete all partially downloaded server metadata.
+    -- Per-character progress in achieverDBpc is preserved.
+    self:ensureDataTables(true)
+
+    local factionGroup = UnitFactionGroup('player')
+    achieverDB.Alliance = factionGroup == 'Alliance'
+    achieverDB.Horde = factionGroup == 'Horde'
+
+    DEFAULT_CHAT_FRAME:AddMessage(
+        '|cffffff00Achiever: retrying full data load (' ..
+        ACHIEVER_SYNC_RETRY_COUNT .. '/' ..
+        ACHIEVER_MAX_SYNC_RETRIES .. ').|r'
+    )
+
+    self:apiEnableDataSend(0)
 end
 
 Achiever.markSyncComplete = function(self, section, current, total)
@@ -205,9 +279,32 @@ Achiever.processServerMessage = function(self, message)
     local params = split(message, '#')
     if (params[1] == 'ACHI') then
         if (not params[2]) then return end
+
+        -- The active server transfer cannot be cancelled. Ignore its remaining
+        -- metadata and retry when no more rows are arriving.
+        if (ACHIEVER_SYNC_ABORTED and isMetadataMessage(params[2])) then
+            if (ACHIEVER_SYNC_RETRY_COUNT < ACHIEVER_MAX_SYNC_RETRIES) then
+                if (params[2] == 'CRV') then
+                    -- CRV is the final marker in the metadata stream.
+                    ACHIEVER_SYNC_RETRY_AT = GetTime() + 0.5
+                else
+                    ACHIEVER_SYNC_RETRY_AT =
+                        GetTime() + ACHIEVER_SYNC_RETRY_DELAY
+                end
+            end
+
+            return
+        end
         if ((params[2] == 'AC' or params[2] == 'CA' or params[2] == 'CR' or
-            params[2] == 'CH_AC' or params[2] == 'CH_CR' or params[2] == 'AE' or
-            params[2] == 'ACU') and not params[3]) then
+            params[2] == 'CH_AC' or params[2] == 'CH_CR' or
+            params[2] == 'AE' or params[2] == 'ACU') and not params[3]) then
+
+            if (params[2] == 'AC' or params[2] == 'CA' or
+                params[2] == 'CR') then
+                self:abortSync(params[2])
+                return
+            end
+
             warn('ignored incomplete server message (' .. params[2] .. ')')
             return
         end
@@ -247,8 +344,21 @@ Achiever.processServerMessage = function(self, message)
             achieverDB.achievements.data[id].refAchievement = tonumber(a[13])
             achieverDB.achievements.totalPoints = achieverDB.achievements.totalPoints + (tonumber(a[7]) or 0)
 
+            --local n = tonumber(a[14])
+            --local c = tonumber(a[15])
+            local a = split(params[3], ';')
+            local fieldCount = table.getn(a)
+            local id = tonumber(a[1])
+            local categoryId = tonumber(a[6])
+            local order = tonumber(a[8])
             local n = tonumber(a[14])
             local c = tonumber(a[15])
+
+            if (fieldCount < 15 or not id or not categoryId or
+                not order or not n or not c) then
+                self:abortSync('achievement')
+                return
+            end
 
             if (achieverDB.achievements.byCategory[categoryId] == nil) then
                 achieverDB.achievements.byCategory[categoryId] = {}
@@ -279,7 +389,8 @@ Achiever.processServerMessage = function(self, message)
             local n = tonumber(a[fieldCount - 1])
             local c = tonumber(a[fieldCount])
             if (fieldCount < 6 or not id or not order or not n or not c) then
-                warn('ignored malformed category data')
+                --warn('ignored malformed category data')
+                self:abortSync('category')
                 return
             end
             achieverDB.categories.data[id] = {}
@@ -320,7 +431,8 @@ Achiever.processServerMessage = function(self, message)
             local n = tonumber(a[fieldCount - 1])
             local c = tonumber(a[fieldCount])
             if (fieldCount < 17 or not id or not achievementId or not order or not n or not c) then
-                warn('ignored malformed criteria data')
+                --warn('ignored malformed criteria data')
+                self:abortSync('criteria')
                 return
             end
             achieverDB.criteria.data[id] = {}
@@ -485,12 +597,6 @@ Achiever.startup = function(self)
     debug('request full data for UI')
     ACHIEVER_STARTED = true
     self:apiEnableDataSend(0)
-    self:apiRequestCategoryInfo(
-        next(achieverDB.categories.data) and (achieverDB.categories.version or 0) or 0)
-    self:apiRequestAchievementInfo(
-        next(achieverDB.achievements.data) and (achieverDB.achievements.version or 0) or 0)
-    self:apiRequestCriteriaInfo(
-        next(achieverDB.criteria.data) and (achieverDB.criteria.version or 0) or 0)
 end
 
 
@@ -513,6 +619,13 @@ Achiever:SetScript("OnEvent", function()
         Achiever:hookChatFrame(ChatFrame1)
         Achiever:startup()
 	end
+end)
+
+Achiever:SetScript("OnUpdate", function()
+    if (ACHIEVER_SYNC_ABORTED and ACHIEVER_SYNC_RETRY_AT and
+        GetTime() >= ACHIEVER_SYNC_RETRY_AT) then
+        Achiever:retrySync()
+    end
 end)
 
 NEWBIE_TOOLTIP_ACHIEVEMENT = "View information about your achievements and statistics.";
