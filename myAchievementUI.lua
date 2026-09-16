@@ -193,6 +193,10 @@ end
 -- [[ AchievementFrame ]] --
 
 function AchievementFrame_ToggleAchievementFrame(toggleStatFrame)
+	if (not Achiever or not Achiever:isReady()) then
+		DEFAULT_CHAT_FRAME:AddMessage('|cffffff00Achiever: achievement data is still loading. Please wait for the ready message.|r')
+		return
+	end
 	AchievementFrameComparison:Hide();
 	AchievementFrameTab_OnClick = AchievementFrameBaseTab_OnClick;
 	if ( not toggleStatFrame ) then

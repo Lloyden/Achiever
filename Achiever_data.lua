@@ -1,5 +1,5 @@
 
-achieverDB = {
+achieverDB = achieverDB or {
 	["achievements"] = {
 		["nextById"] = {},
 		["version"] = -1,
