@@ -5,7 +5,8 @@
 [![Achiever addon](https://i.postimg.cc/Kz1WLNMy/Achiever-Summary.jpg)](https://i.postimg.cc/Kz1WLNMy/Achiever-Summary.jpg)
 
 ## Features:
-- gets categories/achievements/criterias from server
+- loads categories/achievements/criteria from a faction-specific, generated
+  LoadOnDemand addon
 - gets character progress from server
 - gets achievement earned and criteria update from server
 - shows achievements summary, achievements, stats and splash
@@ -30,3 +31,7 @@
 - write a tool so it will help manage categories/achievements/criterias, validate 'em
 
 Planned features https://github.com/users/celguar/projects/2/views/8
+
+This patched build deliberately disables the original in-game metadata
+transfer because it can freeze a Vanilla client. See
+`INSTALL_EMBEDDED_DATA.md` before first use.

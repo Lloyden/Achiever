@@ -1,7 +1,7 @@
 local _G, _ = _G or getfenv()
 
 ACHIEVER_ADDON_NAME = 'Achiever'
-local ACHIEVER_ADDON_VERSION = '0.2.4'
+local ACHIEVER_ADDON_VERSION = '0.6.0'
 local ACHIEVER_ADDON_CHANNEL = 'ACHIEVER_CHANNEL'
 local ACHIEVER_REQUESTED_DATA = false
 local ACHIEVER_STARTED = false
@@ -13,13 +13,21 @@ local ACHIEVER_SYNC_ABORTED = false
 local ACHIEVER_SYNC_RETRY_AT = nil
 local ACHIEVER_SYNC_RETRY_COUNT = 0
 local ACHIEVER_MAX_SYNC_RETRIES = 3
-local ACHIEVER_SYNC_RETRY_DELAY = 3
+local ACHIEVER_START_AT = nil
+local ACHIEVER_LAST_METADATA_AT = nil
+local ACHIEVER_RETRY_STAGE = nil
+local ACHIEVER_NEXT_REQUEST = nil
+local ACHIEVER_USING_CACHE = false
+local ACHIEVER_EXPECTED_COUNTS = { categories = nil, achievements = nil, criteria = nil }
+local ACHIEVER_FINALIZE_TIMEOUT = 10
+local ACHIEVER_FALLBACK_USED = false
 
 local function debug(msg)
-    if achieverDBpc.debug == "enabled" then
+    if achieverDBpc and achieverDBpc.debug == "enabled" then
 	    DEFAULT_CHAT_FRAME:AddMessage('|cffc663fcDEBUG: |cffff55ff'.. (msg or 'nil'))
     end
 end
+
 local function warn(msg)
 	DEFAULT_CHAT_FRAME:AddMessage('|cf3f3f66cWARN: |cffff55ff'.. (msg or 'nil'))
 end
@@ -37,6 +45,13 @@ end
 SLASH_ACHIEVERDEBUG1 = "/acdebug"
 SlashCmdList.ACHIEVERDEBUG = function()
     toggleDebug()
+end
+
+SLASH_ACHIEVERSYNC1 = "/achieversync"
+SlashCmdList.ACHIEVERSYNC = function()
+    DEFAULT_CHAT_FRAME:AddMessage(
+        '|cffffff00Achiever: network metadata sync is disabled because the server sends it ' ..
+        'synchronously and can freeze the client. Regenerate the faction data addon instead.|r')
 end
 
 Achiever = CreateFrame("Frame")
@@ -111,6 +126,94 @@ Achiever.ensureDataTables = function(self, resetServerData)
     achieverDB.criteria.byAchievement = achieverDB.criteria.byAchievement or {}
 end
 
+Achiever.hasCompleteCache = function(self)
+    local factionGroup = UnitFactionGroup('player')
+    local factionMatches =
+        (factionGroup == 'Alliance' and achieverDB and achieverDB.Alliance == true) or
+        (factionGroup == 'Horde' and achieverDB and achieverDB.Horde == true)
+    return type(achieverDB) == 'table' and
+        factionMatches and
+        type(achieverDB.sync) == 'table' and achieverDB.sync.complete == true and
+        achieverDB.sync.embedded == true and tonumber(achieverDB.sync.version) == 1 and
+        type(achieverDB.categories) == 'table' and type(achieverDB.categories.data) == 'table' and
+        type(achieverDB.achievements) == 'table' and type(achieverDB.achievements.data) == 'table' and
+        type(achieverDB.criteria) == 'table' and type(achieverDB.criteria.data) == 'table'
+end
+
+Achiever.loadFactionMetadata = function(self)
+    local factionGroup = UnitFactionGroup('player')
+    local dataAddon
+    if (factionGroup == 'Alliance') then
+        dataAddon = 'Achiever_Data_Alliance'
+    elseif (factionGroup == 'Horde') then
+        dataAddon = 'Achiever_Data_Horde'
+    else
+        return false, 'the player faction is not available yet'
+    end
+
+    -- Each faction database is a separate LoadOnDemand addon. This is the only
+    -- way for the Vanilla client to avoid parsing both large Lua files during
+    -- startup; files listed in Achiever.toc are always loaded unconditionally.
+    ACHIEVER_EMBEDDED_DB = nil
+    local loaded, reason = LoadAddOn(dataAddon)
+    if (not loaded and not IsAddOnLoaded(dataAddon)) then
+        return false, dataAddon .. ' could not be loaded' ..
+            (reason and ' (' .. tostring(reason) .. ')' or '')
+    end
+
+    local embedded = ACHIEVER_EMBEDDED_DB
+    ACHIEVER_EMBEDDED_DB = nil
+    if (type(embedded) ~= 'table') then
+        return false, dataAddon .. ' does not contain generated metadata'
+    end
+
+    achieverDB = embedded
+    if (not self:hasCompleteCache()) then
+        achieverDB = nil
+        return false, dataAddon .. ' contains incomplete or wrong-faction metadata'
+    end
+    return true
+end
+
+Achiever.prepareFreshDatabase = function(self)
+    self:ensureDataTables(true)
+    achieverDB.sync = { complete = false }
+    local factionGroup = UnitFactionGroup('player')
+    achieverDB.Alliance = factionGroup == 'Alliance'
+    achieverDB.Horde = factionGroup == 'Horde'
+    ACHIEVER_EXPECTED_COUNTS = { categories = nil, achievements = nil, criteria = nil }
+    ACHIEVER_FALLBACK_USED = false
+end
+
+local function countTableEntries(values)
+    local count = 0
+    for _ in pairs(values or {}) do count = count + 1 end
+    return count
+end
+
+Achiever.validateSection = function(self, section)
+    if (ACHIEVER_USING_CACHE) then return true end
+    local expected = ACHIEVER_EXPECTED_COUNTS[section]
+
+    local values
+    if (section == 'categories') then values = achieverDB.categories.data end
+    if (section == 'achievements') then values = achieverDB.achievements.data end
+    if (section == 'criteria') then values = achieverDB.criteria.data end
+    local received = countTableEntries(values)
+    if (received < 1) then
+        self:abortSync(section .. ' (no rows received)')
+        return false
+    end
+
+    -- The row counter's total is global, while the server can filter rows for
+    -- the player's faction/expansion. For example, receiving 696 of a global
+    -- 811 achievements is valid. CAV/ACV/CRV are the authoritative completion
+    -- markers; equality with the global total must not trigger a retry.
+    debug('validated ' .. section .. ': ' .. received .. '/' ..
+        (expected or '?') .. ' applicable rows')
+    return true
+end
+
 Achiever.isReady = function(self)
     return ACHIEVER_READY
 end
@@ -122,7 +225,15 @@ Achiever.updateReadyState = function(self)
     end
 
     ACHIEVER_READY = true
+    ACHIEVER_SYNC_ABORTED = false
+    ACHIEVER_SYNC_RETRY_AT = nil
+    ACHIEVER_RETRY_STAGE = nil
     ACHIEVER_SYNC_RETRY_COUNT = 0
+    achieverDB.sync = achieverDB.sync or {}
+    achieverDB.sync.complete = true
+    achieverDB.sync.version = achieverDB.criteria.version or
+        achieverDB.achievements.version or achieverDB.categories.version or 0
+    achieverDBpc.version = achieverDB.sync.version
     DEFAULT_CHAT_FRAME:AddMessage('|cff00ff00Achiever: data loaded. You can now open the achievement window.|r')
 
     -- Events can arrive while the definitions are still downloading.  Store
@@ -142,67 +253,37 @@ Achiever.abortSync = function(self, dataType)
 
     ACHIEVER_SYNC_ABORTED = true
     ACHIEVER_READY = false
+    ACHIEVER_LAST_METADATA_AT = GetTime()
+    if (achieverDB and achieverDB.sync) then achieverDB.sync.complete = false end
     ACHIEVER_SYNC_COMPLETE = {
         categories = false,
         achievements = false,
         criteria = false
     }
 
-    if (ACHIEVER_SYNC_RETRY_COUNT >= ACHIEVER_MAX_SYNC_RETRIES) then
-        ACHIEVER_SYNC_RETRY_AT = nil
-        DEFAULT_CHAT_FRAME:AddMessage(
-            '|cffff2020Achiever: malformed ' .. dataType ..
-            ' data. Loading aborted after ' ..
-            ACHIEVER_MAX_SYNC_RETRIES ..
-            ' retries. Use /reload to try again.|r'
-        )
-        return
-    end
-
-    ACHIEVER_SYNC_RETRY_AT = GetTime() + ACHIEVER_SYNC_RETRY_DELAY
-
+    ACHIEVER_SYNC_RETRY_AT = nil
     DEFAULT_CHAT_FRAME:AddMessage(
-        '|cffffa500Achiever: malformed ' .. dataType ..
-        ' data. Loading aborted; automatic retry ' ..
-        (ACHIEVER_SYNC_RETRY_COUNT + 1) .. '/' ..
-        ACHIEVER_MAX_SYNC_RETRIES ..
-        ' will start when the current transfer has stopped.|r'
+        '|cffff2020Achiever: malformed ' .. dataType ..
+        ' data. Network loading is disabled to protect client memory. ' ..
+        'Regenerate the faction data addon.|r'
     )
 end
 
 Achiever.retrySync = function(self)
-    ACHIEVER_SYNC_RETRY_COUNT = ACHIEVER_SYNC_RETRY_COUNT + 1
-    ACHIEVER_SYNC_RETRY_AT = nil
-    ACHIEVER_SYNC_ABORTED = false
-    ACHIEVER_READY = false
-
-    ACHIEVER_SYNC_COMPLETE = {
-        categories = false,
-        achievements = false,
-        criteria = false
-    }
-
-    -- Delete all partially downloaded server metadata.
-    -- Per-character progress in achieverDBpc is preserved.
-    self:ensureDataTables(true)
-
-    local factionGroup = UnitFactionGroup('player')
-    achieverDB.Alliance = factionGroup == 'Alliance'
-    achieverDB.Horde = factionGroup == 'Horde'
-
     DEFAULT_CHAT_FRAME:AddMessage(
-        '|cffffff00Achiever: retrying full data load (' ..
-        ACHIEVER_SYNC_RETRY_COUNT .. '/' ..
-        ACHIEVER_MAX_SYNC_RETRIES .. ').|r'
+        '|cffffff00Achiever: network retry is disabled. Regenerate the faction data addon instead.|r'
     )
-
-    self:apiEnableDataSend(0)
 end
 
 Achiever.markSyncComplete = function(self, section, current, total)
+    -- Row counters are useful progress information but are not transaction
+    -- boundaries. Only CAV/ACV/CRV may mark a section complete; otherwise the
+    -- UI can become ready before the version/final row reaches the client.
+    if (current and total and total > 0) then
+        ACHIEVER_EXPECTED_COUNTS[section] = total
+    end
     if (current and total and total > 0 and current == total) then
-        ACHIEVER_SYNC_COMPLETE[section] = true
-        self:updateReadyState()
+        debug('received final ' .. section .. ' row; waiting for version marker')
     end
 end
 
@@ -260,6 +341,9 @@ Achiever.hookChatFrame = function(self, frame)
                 s, e = string.find(message, 'ACHI#', 1, true)
             end
             if (s == 1 and e == 5) then
+                -- The server already sends one packet per row. Do not copy the
+                -- entire burst into a second Lua queue: on the 1.12 client that
+                -- doubles peak memory and can crash before CRV is received.
                 self:processServerMessage(message)
                 return false --hide this message
             end
@@ -280,19 +364,18 @@ Achiever.processServerMessage = function(self, message)
     if (params[1] == 'ACHI') then
         if (not params[2]) then return end
 
-        -- The active server transfer cannot be cancelled. Ignore its remaining
-        -- metadata and retry when no more rows are arriving.
-        if (ACHIEVER_SYNC_ABORTED and isMetadataMessage(params[2])) then
-            if (ACHIEVER_SYNC_RETRY_COUNT < ACHIEVER_MAX_SYNC_RETRIES) then
-                if (params[2] == 'CRV') then
-                    -- CRV is the final marker in the metadata stream.
-                    ACHIEVER_SYNC_RETRY_AT = GetTime() + 0.5
-                else
-                    ACHIEVER_SYNC_RETRY_AT =
-                        GetTime() + ACHIEVER_SYNC_RETRY_DELAY
-                end
-            end
+        if (isMetadataMessage(params[2])) then
+            ACHIEVER_LAST_METADATA_AT = GetTime()
+            -- Metadata is never accepted over chat in 0.6.0. A full response
+            -- is synchronous on the world thread and was the source of the
+            -- frozen sessions and memory crashes. Only generated data is used.
+            return
+        end
 
+        -- The active server transfer cannot be cancelled. Ignore its remaining
+        -- metadata. Never start another automatic transfer: the original
+        -- synchronous burst may already have pushed the client near its limit.
+        if (ACHIEVER_SYNC_ABORTED and isMetadataMessage(params[2])) then
             return
         end
         if ((params[2] == 'AC' or params[2] == 'CA' or params[2] == 'CR' or
@@ -311,11 +394,15 @@ Achiever.processServerMessage = function(self, message)
         if (params[2] == 'AC') then
             --debug('server response: new achievement entry ')
             local a = split(params[3], ';')
+            local fieldCount = table.getn(a)
             local id = tonumber(a[1])
             local categoryId = tonumber(a[6])
             local order = tonumber(a[8])
-            if (not id or not categoryId or not order) then
-                warn('ignored malformed achievement data')
+            local n = tonumber(a[14])
+            local c = tonumber(a[15])
+            if (fieldCount ~= 15 or not id or not categoryId or
+                not order or not n or not c) then
+                self:abortSync('achievement')
                 return
             end
             local old = achieverDB.achievements.data[id]
@@ -323,16 +410,14 @@ Achiever.processServerMessage = function(self, message)
                 achieverDB.achievements.totalPoints = achieverDB.achievements.totalPoints - (old.points or 0)
             end
             achieverDB.achievements.data[id] = {}
-            achieverDB.achievements.data[id].id = tonumber(id)
-            achieverDB.achievements.data[id].faction = tonumber(a[2])
-            achieverDB.achievements.data[id].previousId = tonumber(a[3])
+            achieverDB.achievements.data[id].id = id
             local name = ''
             if (a[4] ~= '_') then name = a[4] end
             achieverDB.achievements.data[id].name = name
             local description = ''
             if (a[5] ~= '_') then description = a[5] end
             achieverDB.achievements.data[id].description = description
-            achieverDB.achievements.data[id].categoryId = tonumber(a[6])
+            achieverDB.achievements.data[id].categoryId = categoryId
             achieverDB.achievements.data[id].points = tonumber(a[7]) or 0
             achieverDB.achievements.data[id].order = order
             achieverDB.achievements.data[id].flags = tonumber(a[9]) or 0
@@ -340,25 +425,7 @@ Achiever.processServerMessage = function(self, message)
             local titleReward = ''
             if (a[11] ~= '_') then titleReward = a[11] end
             achieverDB.achievements.data[id].titleReward = titleReward
-            achieverDB.achievements.data[id].count = tonumber(a[12])
-            achieverDB.achievements.data[id].refAchievement = tonumber(a[13])
             achieverDB.achievements.totalPoints = achieverDB.achievements.totalPoints + (tonumber(a[7]) or 0)
-
-            --local n = tonumber(a[14])
-            --local c = tonumber(a[15])
-            local a = split(params[3], ';')
-            local fieldCount = table.getn(a)
-            local id = tonumber(a[1])
-            local categoryId = tonumber(a[6])
-            local order = tonumber(a[8])
-            local n = tonumber(a[14])
-            local c = tonumber(a[15])
-
-            if (fieldCount < 15 or not id or not categoryId or
-                not order or not n or not c) then
-                self:abortSync('achievement')
-                return
-            end
 
             if (achieverDB.achievements.byCategory[categoryId] == nil) then
                 achieverDB.achievements.byCategory[categoryId] = {}
@@ -378,8 +445,13 @@ Achiever.processServerMessage = function(self, message)
         elseif (params[2] == 'ACV') then
             debug('server response: achievement data version')
             achieverDB.achievements.version = tonumber(params[3])
+            if (not self:validateSection('achievements')) then return end
             ACHIEVER_SYNC_COMPLETE.achievements = true
             self:updateReadyState()
+            if (ACHIEVER_RETRY_STAGE == 'achievements' and not ACHIEVER_SYNC_ABORTED) then
+                ACHIEVER_RETRY_STAGE = 'criteria'
+                ACHIEVER_NEXT_REQUEST = { at = GetTime() + 0.5, section = 'criteria' }
+            end
         elseif (params[2] == 'CA') then
             --debug('server response: get all categories')
             local a = split(params[3], ";")
@@ -412,8 +484,13 @@ Achiever.processServerMessage = function(self, message)
         elseif (params[2] == 'CAV') then
             debug('server response: category data version')
             achieverDB.categories.version = tonumber(params[3])
+            if (not self:validateSection('categories')) then return end
             ACHIEVER_SYNC_COMPLETE.categories = true
             self:updateReadyState()
+            if (ACHIEVER_RETRY_STAGE == 'categories' and not ACHIEVER_SYNC_ABORTED) then
+                ACHIEVER_RETRY_STAGE = 'achievements'
+                ACHIEVER_NEXT_REQUEST = { at = GetTime() + 0.5, section = 'achievements' }
+            end
         elseif (params[2] == 'CR') then
             --debug('server response: get all criteria')
             local a = split(params[3], ";")
@@ -435,25 +512,26 @@ Achiever.processServerMessage = function(self, message)
                 self:abortSync('criteria')
                 return
             end
+
+            -- The module sends every WotLK criteria row, even on a Classic
+            -- realm. Keep only criteria belonging to an achievement actually
+            -- delivered for this faction/patch. This removes thousands of
+            -- unreachable tables from the Vanilla client's small Lua heap.
+            if (not achieverDB.achievements.data[achievementId]) then
+                self:markSyncComplete('criteria', n, c)
+                return
+            end
             achieverDB.criteria.data[id] = {}
-            achieverDB.criteria.data[id].id = tonumber(id)
-            achieverDB.criteria.data[id].achievementId = tonumber(a[2])
+            achieverDB.criteria.data[id].id = id
+            achieverDB.criteria.data[id].achievementId = achievementId
             achieverDB.criteria.data[id].type = tonumber(a[3])
             achieverDB.criteria.data[id].assetId = tonumber(a[4])
             achieverDB.criteria.data[id].count = tonumber(a[5])
-            achieverDB.criteria.data[id].assetId1 = tonumber(a[6])
-            achieverDB.criteria.data[id].count1 = tonumber(a[7])
-            achieverDB.criteria.data[id].assetId2 = tonumber(a[8])
-            achieverDB.criteria.data[id].count2 = tonumber(a[9])
             local name = ''
             local encodedName = joinFields(a, 10, fieldCount - 7, ';')
             if (encodedName ~= '_') then name = encodedName end
             achieverDB.criteria.data[id].name = name
             achieverDB.criteria.data[id].flags = flags or 0
-            achieverDB.criteria.data[id].timedType = timedType
-            achieverDB.criteria.data[id].timerStartEvent = timerStartEvent
-            achieverDB.criteria.data[id].timeLimit = timeLimit
-            achieverDB.criteria.data[id].order = order
 
             if (achieverDB.criteria.byAchievement[achievementId] == nil) then
                 achieverDB.criteria.byAchievement[achievementId] = {}
@@ -464,6 +542,7 @@ Achiever.processServerMessage = function(self, message)
         elseif (params[2] == 'CRV') then
             debug('server response: criteria data version')
             achieverDB.criteria.version = tonumber(params[3])
+            if (not self:validateSection('criteria')) then return end
             ACHIEVER_SYNC_COMPLETE.criteria = true
             self:updateReadyState()
         elseif (params[2] == 'CH_AC') then
@@ -581,7 +660,6 @@ Achiever.startup = function(self)
         return
     end
     
-    self:ensureDataTables(false)
     local factionGroup, localedFaction = UnitFactionGroup("player");
 
     if (not achieverDBpc.debug) then achieverDBpc.debug = "disabled" end
@@ -589,14 +667,33 @@ Achiever.startup = function(self)
     if (not achieverDBpc.buttonmain) then achieverDBpc.buttonmain = "enabled" end
     if (not achieverDBpc.version) then achieverDBpc.version = 0 end
 
+    local metadataLoaded, metadataError = self:loadFactionMetadata()
+    local requestVersion = 1
+    if (metadataLoaded) then
+        ACHIEVER_USING_CACHE = true
+        ACHIEVER_READY = true
+        ACHIEVER_SYNC_COMPLETE = { categories = true, achievements = true, criteria = true }
+        requestVersion = tonumber(achieverDB.sync.version) or 0
+        DEFAULT_CHAT_FRAME:AddMessage('|cff00ff00Achiever: ' .. factionGroup ..
+            ' metadata loaded; checking the server version.|r')
+    else
+        ACHIEVER_STARTED = true
+        DEFAULT_CHAT_FRAME:AddMessage(
+            '|cffff2020Achiever: faction metadata is missing: ' ..
+            (metadataError or 'unknown error') .. '. Network sync was not started. ' ..
+            'Generate and install the matching Achiever_Data faction addon.|r')
+        return
+    end
+
     achieverDB.Alliance = factionGroup == "Alliance"
     achieverDB.Horde = factionGroup == "Horde"
-    -- The metadata database is rebuilt above, so asking with a cached version
-    -- can make the server correctly send no rows and leave the client empty.
-    -- Always request a complete snapshot.
-    debug('request full data for UI')
+    -- The server will now send the complete progress snapshot (but no
+    -- metadata). Clear stale per-character rows before receiving it.
+    achieverDBpc.criteria = {}
+    achieverDBpc.achievements = {}
+    debug('enable addon data; client version ' .. requestVersion)
     ACHIEVER_STARTED = true
-    self:apiEnableDataSend(0)
+    self:apiEnableDataSend(requestVersion)
 end
 
 
@@ -615,13 +712,57 @@ Achiever:SetScript("OnEvent", function()
         debug('OnEvent CHAT_MSG_ADDON')
     elseif (event == 'VARIABLES_LOADED') then
         debug('VARIABLES_LOADED')
-    elseif (event == 'PLAYER_ENTERING_WORLD') then
+	elseif (event == 'PLAYER_ENTERING_WORLD') then
         Achiever:hookChatFrame(ChatFrame1)
-        Achiever:startup()
+        -- Let the world, SavedVariables and chat system settle before asking
+        -- the server to emit a large response.
+        if (not ACHIEVER_STARTED and not ACHIEVER_START_AT) then
+            ACHIEVER_START_AT = GetTime() + 2
+        end
 	end
 end)
 
 Achiever:SetScript("OnUpdate", function()
+    if (ACHIEVER_START_AT and GetTime() >= ACHIEVER_START_AT) then
+        ACHIEVER_START_AT = nil
+        Achiever:startup()
+    end
+
+    -- The server sends completion markers, but a single lost chat packet must
+    -- not leave the addon loading forever. Once the synchronous stream has
+    -- been quiet for ten seconds, a non-empty metadata set is safe to commit.
+    if (ACHIEVER_STARTED and not ACHIEVER_READY and not ACHIEVER_SYNC_ABORTED and
+        not ACHIEVER_USING_CACHE and not ACHIEVER_FALLBACK_USED and
+        ACHIEVER_LAST_METADATA_AT and
+        GetTime() - ACHIEVER_LAST_METADATA_AT >= ACHIEVER_FINALIZE_TIMEOUT) then
+
+        local categoryCount = countTableEntries(achieverDB.categories.data)
+        local achievementCount = countTableEntries(achieverDB.achievements.data)
+        local criteriaCount = countTableEntries(achieverDB.criteria.data)
+        if (categoryCount > 0 and achievementCount > 0 and criteriaCount > 0) then
+            ACHIEVER_FALLBACK_USED = true
+            achieverDB.categories.version = tonumber(achieverDB.categories.version) or 1
+            achieverDB.achievements.version = tonumber(achieverDB.achievements.version) or 1
+            achieverDB.criteria.version = tonumber(achieverDB.criteria.version) or 1
+            if (achieverDB.categories.version < 1) then achieverDB.categories.version = 1 end
+            if (achieverDB.achievements.version < 1) then achieverDB.achievements.version = 1 end
+            if (achieverDB.criteria.version < 1) then achieverDB.criteria.version = 1 end
+            ACHIEVER_SYNC_COMPLETE = { categories = true, achievements = true, criteria = true }
+            DEFAULT_CHAT_FRAME:AddMessage('|cffffff00Achiever: completion marker was missed; using the received data.|r')
+            Achiever:updateReadyState()
+        end
+    end
+
+    if (ACHIEVER_NEXT_REQUEST and GetTime() >= ACHIEVER_NEXT_REQUEST.at) then
+        local section = ACHIEVER_NEXT_REQUEST.section
+        ACHIEVER_NEXT_REQUEST = nil
+        if (section == 'achievements') then
+            Achiever:apiRequestAchievementInfo(0)
+        elseif (section == 'criteria') then
+            Achiever:apiRequestCriteriaInfo(0)
+        end
+    end
+
     if (ACHIEVER_SYNC_ABORTED and ACHIEVER_SYNC_RETRY_AT and
         GetTime() >= ACHIEVER_SYNC_RETRY_AT) then
         Achiever:retrySync()
