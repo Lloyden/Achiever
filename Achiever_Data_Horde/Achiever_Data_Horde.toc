@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: Achiever Data - Horde
+## Notes: Horde metadata for Achiever (loaded on demand)
+## Version: 0.6.0
+## Dependencies: Achiever
+## LoadOnDemand: 1
+
+Achiever_data.lua
